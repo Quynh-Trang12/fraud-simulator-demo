@@ -246,14 +246,14 @@ export function TransactionForm() {
         </div>
       )}
 
-      <div className="grid xl:grid-cols-3 gap-4 sm:gap-6">
+      <div className="grid lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] gap-4 sm:gap-6">
         {/* Left Column - Form */}
-        <div className="xl:col-span-2 space-y-4 sm:space-y-6">
+        <div className="min-w-0 space-y-4 sm:space-y-6">
           {/* Time & Type */}
           <fieldset className="form-fieldset">
             <legend className="form-legend">Time & Event</legend>
             
-            <div className="grid sm:grid-cols-2 gap-3 sm:gap-4">
+            <div className="grid md:grid-cols-2 gap-3 sm:gap-4">
               <div className="space-y-2">
                 <Label htmlFor="step">Time Step (Hour)</Label>
                 <Input
@@ -465,14 +465,14 @@ export function TransactionForm() {
         </div>
 
         {/* Right Column - Presets */}
-        <div className="xl:col-span-1">
+        <div className="min-w-0">
           <PresetButtons onSelect={handlePresetSelect} disabled={isSubmitting} />
         </div>
       </div>
 
       {/* Sticky Bottom Bar */}
       <div className="sticky-bottom-bar">
-        <div className="container px-3 sm:px-4 flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 justify-end">
+        <div className="max-w-6xl mx-auto px-4 flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 justify-end">
           <Button
             type="button"
             variant="outline"
