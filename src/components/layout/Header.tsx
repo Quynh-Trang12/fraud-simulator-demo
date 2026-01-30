@@ -26,11 +26,11 @@ export function Header() {
         <Link 
           to="/" 
           className="flex items-center gap-2 text-primary font-semibold"
-          aria-label="Fraud Detection Simulator - Home"
+          aria-label="AnomalyWatchers - Home"
         >
           <Shield className="h-5 w-5 sm:h-6 sm:w-6" aria-hidden="true" />
-          <span className="hidden sm:inline text-sm sm:text-base">Fraud Detection Simulator</span>
-          <span className="sm:hidden text-sm">FDS</span>
+          <span className="hidden sm:inline text-sm sm:text-base">AnomalyWatchers</span>
+          <span className="sm:hidden text-sm">AW</span>
         </Link>
 
         {/* Desktop navigation */}
