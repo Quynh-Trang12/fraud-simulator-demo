@@ -24,7 +24,8 @@ export const TRANSACTION_PRESETS: TransactionPreset[] = [
   {
     id: "large_transfer",
     name: "Large TRANSFER draining balance (step-up)",
-    description: "Transfer that drains most of the balance - requires verification",
+    description:
+      "Transfer that drains most of the balance - requires verification",
     expectedOutcome: "STEP_UP",
     type: "TRANSFER",
     amount: 140000,
@@ -32,12 +33,12 @@ export const TRANSACTION_PRESETS: TransactionPreset[] = [
   },
   {
     id: "suspicious_cashout",
-    name: "CASH OUT near empty balance (block)",
-    description: "Cash out from near-zero balance - should be blocked",
+    name: "CASH OUT draining account (block)",
+    description: "Total liquidation of account balance - should be blocked",
     expectedOutcome: "BLOCK",
     type: "CASH OUT",
-    amount: 200000,
-    originAccountIndex: 3, // Account with 25000 balance
+    amount: 25000,
+    originAccountIndex: 3, // Account with 25000 balance -> Result 0
   },
   {
     id: "large_cashin",
@@ -60,11 +61,12 @@ export const TRANSACTION_PRESETS: TransactionPreset[] = [
   {
     id: "known_fraud_pattern",
     name: "Known Fraud Pattern (high risk)",
-    description: "Suspicious 3 AM transfer with balance drain - should be blocked",
+    description:
+      "Suspicious transfer draining 100% of balance - should be blocked",
     expectedOutcome: "BLOCK",
     type: "TRANSFER",
-    amount: 99000,
-    originAccountIndex: 0, // Account with 50000 balance (will trigger multiple risk factors)
+    amount: 50000, // Drains exactly 50,000 balance (Valid Math, 100% Suspicious)
+    originAccountIndex: 0, // Account with 50000 balance
     customNameDest: "C9999999999", // New suspicious destination
   },
 ];

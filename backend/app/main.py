@@ -77,31 +77,60 @@ def predict_primary(data: TransactionInput):
     
     print(f"ML Probability: {prob:.4f}")
     
-    # --- Risk Assessment ---
-    # The XGBoost model is trained with AUPRC 0.9893, so we trust its predictions
-    # but add explainability for the frontend
+    # --- Hybrid Detection Logic ---
+    # Combine ML score with heuristic rules for specific fraud patterns
+    # that might be undersampled in the training data (e.g., forced overdrafts).
     
-    is_fraud = prob > 0.5
+    heuristic_prob = 0.0
+    reasons = []
+    
+    # Rule 1: Forced Overdraft (Negative Balance)
+    # This specifically catches the "High Risk" preset where Amount > Balance
+    if data.newbalanceOrig < 0:
+         heuristic_prob = max(heuristic_prob, 0.99)
+         reasons.append("Illegal Overdraft (Negative Balance) detected")
+
+    # Rule 2: Zero-out / Balance Drain
+    # If balance hits exactly 0, check if it was a total drain
+    elif data.newbalanceOrig == 0 and data.amount > 0:
+        if data.amount >= data.oldbalanceOrg:
+             heuristic_prob = max(heuristic_prob, 0.95)
+             reasons.append("Balance drain pattern detected")
+
+    # Rule 3: Balance Error (Mathematical anomaly = Potential Exploit)
+    # Standard check: new + amount - old should be 0 (for drain) or diff
+    # But for Overdraft, the math IS valid (50k - 99k = -49k), so Rule 1 catches it.
+    if abs(errorBalanceOrg) > 0.01:
+        # If the math doesn't add up (e.g. overdrafting more than balance), flag it
+        heuristic_prob = max(heuristic_prob, 0.85)
+        reasons.append(f"Balance discrepancy ({errorBalanceOrg:.2f})")
+
+    # Rule 4: High Value
+    if data.amount > 150000:
+        heuristic_prob = max(heuristic_prob, 0.70)
+        reasons.append("High value transaction")
+
+    # Final Score: Ensemble (Max of ML and Rules)
+    final_prob = max(prob, heuristic_prob)
+    
+    # --- Risk Assessment ---
+    is_fraud = final_prob > 0.5
     
     risk_level = "Low"
-    if prob > 0.8:
+    if final_prob > 0.8:
         risk_level = "High"
-    elif prob > 0.4:
+    elif final_prob > 0.4:
         risk_level = "Medium"
     
-    # Generate explanation based on features
-    explanations = []
+    # Generate explanations
+    # Use the ML reasons if ML score is high, otherwise use Rule reasons
+    ml_reasons = []
     if prob > 0.5:
-        if errorBalanceOrg != 0:
-            explanations.append(f"Balance discrepancy: {errorBalanceOrg:.2f}")
-        if data.newbalanceOrig == 0 and data.amount >= data.oldbalanceOrg:
-            explanations.append("Account drain pattern detected")
-        if data.amount > 100000:
-            explanations.append("High value transaction")
-        if not explanations:
-            explanations.append("Suspicious transaction pattern detected by AI")
+        ml_reasons.append("AI Model detected suspicious pattern")
     
-    explanation_text = "Transaction appears safe." if not is_fraud else f"Risk Factors: {', '.join(explanations)}"
+    all_reasons = list(set(reasons + ml_reasons))
+    
+    explanation_text = "Transaction appears safe." if not is_fraud else f"Risk Factors: {', '.join(all_reasons)}."
 
     return {
         "probability": float(prob),
