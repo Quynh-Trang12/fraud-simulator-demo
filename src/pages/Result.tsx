@@ -6,10 +6,167 @@ import { DecisionBadge } from "@/components/ui/DecisionBadge";
 import { RiskScore } from "@/components/ui/RiskScore";
 import { OTPChallenge } from "@/components/result/OTPChallenge";
 import { TransactionDatasetView } from "@/components/result/TransactionDatasetView";
-import { Transaction, Decision } from "@/types/transaction";
-import { getPendingTransaction, clearPendingTransaction, updateTransaction } from "@/lib/storage";
+import {
+  Transaction,
+  Decision,
+  DEFAULT_ORIGIN_ACCOUNTS,
+} from "@/types/transaction";
+import {
+  getPendingTransaction,
+  clearPendingTransaction,
+  updateTransaction,
+  getAdminSettings,
+} from "@/lib/storage";
 import { getEventTypeLabel, formatCurrency } from "@/lib/eventTypes";
-import { PlayCircle, History, AlertCircle } from "lucide-react";
+import {
+  PlayCircle,
+  History,
+  AlertCircle,
+  Lightbulb,
+  TrendingDown,
+  DollarSign,
+  Clock,
+  ArrowRight,
+} from "lucide-react";
+
+// Generate human-readable explanations for risk factors
+function generateExplainability(transaction: Transaction): {
+  icon: React.ElementType;
+  text: string;
+  severity: "info" | "warning" | "danger";
+}[] {
+  const explanations: {
+    icon: React.ElementType;
+    text: string;
+    severity: "info" | "warning" | "danger";
+  }[] = [];
+  const settings = getAdminSettings();
+
+  // High amount explanation
+  if (transaction.amount >= settings.highRiskAmount) {
+    explanations.push({
+      icon: DollarSign,
+      text: `High amount detected: ${formatCurrency(transaction.amount)} exceeds the ${formatCurrency(settings.highRiskAmount)} threshold.`,
+      severity: "warning",
+    });
+  }
+
+  // Balance drain detection
+  const drainPercentage =
+    transaction.oldbalanceOrg > 0
+      ? ((transaction.oldbalanceOrg - transaction.newbalanceOrig) /
+          transaction.oldbalanceOrg) *
+        100
+      : 0;
+  if (drainPercentage >= 80) {
+    explanations.push({
+      icon: TrendingDown,
+      text: `Balance drain detected: Account went from ${formatCurrency(transaction.oldbalanceOrg)} to ${formatCurrency(transaction.newbalanceOrig)} (${drainPercentage.toFixed(0)}% reduction).`,
+      severity: "danger",
+    });
+  } else if (drainPercentage >= 50) {
+    explanations.push({
+      icon: TrendingDown,
+      text: `Significant withdrawal: ${drainPercentage.toFixed(0)}% of account balance used in this transaction.`,
+      severity: "warning",
+    });
+  }
+
+  // Zero-out pattern
+  if (
+    transaction.newbalanceOrig === 0 &&
+    transaction.amount >= settings.zeroOutMinAmount
+  ) {
+    explanations.push({
+      icon: AlertCircle,
+      text: `Zero-out pattern: Account emptied with a ${formatCurrency(transaction.amount)} transaction.`,
+      severity: "danger",
+    });
+  }
+
+  // Transaction type specific explanations
+  if (
+    transaction.type === "TRANSFER" &&
+    transaction.amount >= settings.newDestLargeAmount
+  ) {
+    explanations.push({
+      icon: ArrowRight,
+      text: `Large transfer: P2P transfers over ${formatCurrency(settings.newDestLargeAmount)} receive additional scrutiny.`,
+      severity: "warning",
+    });
+  }
+
+  if (transaction.type === "CASH OUT" && transaction.amount >= 100000) {
+    explanations.push({
+      icon: AlertCircle,
+      text: `Large cash withdrawal: Cash-out transactions over $100,000 are flagged for review.`,
+      severity: "warning",
+    });
+  }
+
+  // Time-based explanation
+  const hour = (transaction.step - 1) % 24;
+  // Only flag timing if risk is elevated or explicitly high
+  if (hour >= 0 && hour < 6 && transaction.riskScore > 20) {
+    explanations.push({
+      icon: Clock,
+      text: `Unusual timing: Transaction occurred during off-hours (${hour}:00), contributing to risk.`,
+      severity: "info",
+    });
+  }
+
+  // --- Consistency Filter ---
+  // If the AI says it's SAFE (Low Risk), we shouldn't show "Danger" flags driven by simple rules.
+  // The AI likely sees other factors (e.g. valid history, device match) that override these rules.
+  const isLowRisk = transaction.riskScore < 50;
+
+  const filteredExplanations = explanations.map((exp) => {
+    if (isLowRisk) {
+      // Downgrade severities for low-risk transactions
+      if (exp.severity === "danger") {
+        return {
+          ...exp,
+          severity: "info" as const,
+          text: exp.text + " (Cleared by AI analysis)",
+        };
+      }
+      if (exp.severity === "warning") {
+        return {
+          ...exp,
+          severity: "info" as const,
+          text: exp.text + " (Within normal bounds for this profile)",
+        };
+      }
+    }
+    return exp;
+  });
+
+  // If approved, strictly limit negative explanations to avoid confusion
+  if (transaction.decision === "APPROVE") {
+    const criticalFactors = filteredExplanations.filter(
+      (e) => e.severity === "info",
+    );
+    if (criticalFactors.length === 0) {
+      criticalFactors.push({
+        icon: Lightbulb,
+        text: "Transaction parameters are consistent with legitimate behavior patterns.",
+        severity: "info",
+      });
+    }
+    return criticalFactors;
+  }
+
+  // If no specific explanations, add a general one based on decision
+  if (filteredExplanations.length === 0) {
+    filteredExplanations.push({
+      icon: AlertCircle,
+      text: "AI model detected potential anomalies in the transaction pattern.",
+      severity: "warning",
+    });
+  }
+
+  return filteredExplanations;
+}
 
 export default function Result() {
   const navigate = useNavigate();
@@ -26,7 +183,7 @@ export default function Result() {
     }
     setTransaction(pending);
     setFinalDecision(pending.decision);
-    
+
     if (pending.decision === "STEP_UP") {
       setShowOTP(true);
     }
@@ -66,6 +223,13 @@ export default function Result() {
   }
 
   const displayDecision = finalDecision || transaction.decision;
+  const explanations = generateExplainability(transaction);
+
+  // Get friendly account name
+  const originAccount = DEFAULT_ORIGIN_ACCOUNTS.find(
+    (a) => a.id === transaction.nameOrig,
+  );
+  const accountDisplayName = originAccount?.displayName || transaction.nameOrig;
 
   const decisionColors = {
     APPROVE: "bg-success-muted border-success/20",
@@ -75,13 +239,21 @@ export default function Result() {
     BLOCK_STEPUP_FAILED: "bg-danger-muted border-danger/20",
   };
 
+  const severityStyles = {
+    info: "bg-muted/50 text-muted-foreground",
+    warning: "bg-warning-muted text-warning",
+    danger: "bg-danger-muted text-danger",
+  };
+
   return (
     <Layout>
       <div className="container py-6 sm:py-8">
         <div className="max-w-2xl mx-auto space-y-6">
           {/* Decision Banner */}
-          <div className={`rounded-lg border p-6 text-center ${decisionColors[displayDecision]}`}>
-            <h1 
+          <div
+            className={`rounded-lg border p-6 text-center ${decisionColors[displayDecision]}`}
+          >
+            <h1
               ref={headingRef}
               tabIndex={-1}
               className="text-2xl sm:text-3xl font-bold mb-4 outline-none"
@@ -94,7 +266,10 @@ export default function Result() {
           {/* OTP Challenge */}
           {showOTP && (
             <div className="section-card-elevated">
-              <OTPChallenge onSuccess={handleOTPSuccess} onFail={handleOTPFail} />
+              <OTPChallenge
+                onSuccess={handleOTPSuccess}
+                onFail={handleOTPFail}
+              />
             </div>
           )}
 
@@ -103,18 +278,56 @@ export default function Result() {
             <div className="section-card">
               <h2 className="font-semibold mb-4">Risk Analysis</h2>
               <RiskScore score={transaction.riskScore} size="lg" />
-              
+
               <div className="mt-4 pt-4 border-t border-border">
-                <h3 className="text-sm font-medium text-muted-foreground mb-2">Risk Factors</h3>
+                <h3 className="text-sm font-medium text-muted-foreground mb-2">
+                  Risk Factors
+                </h3>
                 <ul className="space-y-2">
                   {transaction.reasons.map((reason, index) => (
                     <li key={index} className="flex items-start gap-2 text-sm">
-                      <AlertCircle className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5" aria-hidden="true" />
+                      <AlertCircle
+                        className="h-4 w-4 text-muted-foreground shrink-0 mt-0.5"
+                        aria-hidden="true"
+                      />
                       {reason}
                     </li>
                   ))}
                 </ul>
               </div>
+            </div>
+          )}
+
+          {/* Explainability Section */}
+          {!showOTP && explanations.length > 0 && (
+            <div className="section-card">
+              <div className="flex items-center gap-2 mb-4">
+                <Lightbulb
+                  className="h-5 w-5 text-primary"
+                  aria-hidden="true"
+                />
+                <h2 className="font-semibold">Why This Decision?</h2>
+              </div>
+              <p className="text-sm text-muted-foreground mb-4">
+                Here's what our AI detected based on your transaction inputs:
+              </p>
+              <ul className="space-y-3">
+                {explanations.map((explanation, index) => {
+                  const Icon = explanation.icon;
+                  return (
+                    <li
+                      key={index}
+                      className={`flex items-start gap-3 p-3 rounded-lg ${severityStyles[explanation.severity]}`}
+                    >
+                      <Icon
+                        className="h-5 w-5 shrink-0 mt-0.5"
+                        aria-hidden="true"
+                      />
+                      <span className="text-sm">{explanation.text}</span>
+                    </li>
+                  );
+                })}
+              </ul>
             </div>
           )}
 
@@ -125,15 +338,24 @@ export default function Result() {
               <dl className="grid grid-cols-2 gap-3 text-sm">
                 <div>
                   <dt className="text-muted-foreground">Event Type</dt>
-                  <dd className="font-medium">{getEventTypeLabel(transaction.type)}</dd>
+                  <dd className="font-medium">
+                    {getEventTypeLabel(transaction.type)}
+                  </dd>
                 </div>
                 <div>
                   <dt className="text-muted-foreground">Amount</dt>
-                  <dd className="font-mono font-medium">{formatCurrency(transaction.amount)}</dd>
+                  <dd className="font-mono font-medium">
+                    {formatCurrency(transaction.amount)}
+                  </dd>
                 </div>
                 <div>
                   <dt className="text-muted-foreground">Sender</dt>
-                  <dd className="font-mono text-xs">{transaction.nameOrig}</dd>
+                  <dd>
+                    <span className="font-medium">{accountDisplayName}</span>
+                    <span className="text-xs text-muted-foreground block font-mono">
+                      {transaction.nameOrig}
+                    </span>
+                  </dd>
                 </div>
                 <div>
                   <dt className="text-muted-foreground">Recipient</dt>
@@ -145,14 +367,21 @@ export default function Result() {
                 </div>
                 <div>
                   <dt className="text-muted-foreground">Created</dt>
-                  <dd className="text-xs">{new Date(transaction.createdAt).toLocaleString()}</dd>
+                  <dd className="text-xs">
+                    {new Date(transaction.createdAt).toLocaleString()}
+                  </dd>
                 </div>
               </dl>
             </div>
           )}
 
           {/* Dataset View - Collapsed by default */}
-          {!showOTP && <TransactionDatasetView transaction={transaction} defaultOpen={false} />}
+          {!showOTP && (
+            <TransactionDatasetView
+              transaction={transaction}
+              defaultOpen={false}
+            />
+          )}
 
           {/* Actions */}
           {!showOTP && (

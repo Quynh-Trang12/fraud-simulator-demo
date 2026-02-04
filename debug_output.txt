@@ -1,0 +1,18 @@
+Encoder Classes: ['CASH_OUT', 'TRANSFER']
+
+--- Scenario Testing ---
+
+Scenario: User Scenario (Overdraft)
+Features: [[1.0, 99000.0, 50000.0, 0.0, 49000.0, 99000.0]]
+ErrorOrg: 49000.0, ErrorDest: 99000.0
+Risk Score: 0.00%
+
+Scenario: Exact Drain (Valid Math)
+Features: [[1.0, 50000.0, 50000.0, 0.0, 0.0, 50000.0]]
+ErrorOrg: 0.0, ErrorDest: 50000.0
+Risk Score: 0.00%
+
+Scenario: Typical Fraud (Pattern)
+Features: [[1.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0]]
+ErrorOrg: 50000.0, ErrorDest: 50000.0
+Risk Score: 0.00%

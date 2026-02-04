@@ -1,11 +1,11 @@
-import { 
-  Transaction, 
-  AdminSettings, 
-  AdminAuditLog, 
+import {
+  Transaction,
+  AdminSettings,
+  AdminAuditLog,
   DestinationBalance,
   OriginAccount,
   DEFAULT_ADMIN_SETTINGS,
-  DEFAULT_ORIGIN_ACCOUNTS
+  DEFAULT_ORIGIN_ACCOUNTS,
 } from "@/types/transaction";
 
 const STORAGE_KEYS = {
@@ -34,24 +34,32 @@ export function saveTransaction(transaction: Transaction): void {
   localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
 }
 
-export function updateTransaction(id: string, updates: Partial<Transaction>): void {
+export function updateTransaction(
+  id: string,
+  updates: Partial<Transaction>,
+): void {
   const transactions = getTransactions();
-  const index = transactions.findIndex(t => t.id === id);
+  const index = transactions.findIndex((t) => t.id === id);
   if (index !== -1) {
     transactions[index] = { ...transactions[index], ...updates };
-    localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(transactions));
+    localStorage.setItem(
+      STORAGE_KEYS.TRANSACTIONS,
+      JSON.stringify(transactions),
+    );
   }
 }
 
 export function getTransactionById(id: string): Transaction | undefined {
-  return getTransactions().find(t => t.id === id);
+  return getTransactions().find((t) => t.id === id);
 }
 
 // Admin Settings
 export function getAdminSettings(): AdminSettings {
   try {
     const data = localStorage.getItem(STORAGE_KEYS.ADMIN_SETTINGS);
-    return data ? { ...DEFAULT_ADMIN_SETTINGS, ...JSON.parse(data) } : DEFAULT_ADMIN_SETTINGS;
+    return data
+      ? { ...DEFAULT_ADMIN_SETTINGS, ...JSON.parse(data) }
+      : DEFAULT_ADMIN_SETTINGS;
   } catch {
     return DEFAULT_ADMIN_SETTINGS;
   }
@@ -71,7 +79,9 @@ export function getAdminAuditLog(): AdminAuditLog[] {
   }
 }
 
-export function addAuditLogEntry(entry: Omit<AdminAuditLog, "id" | "changedAt">): void {
+export function addAuditLogEntry(
+  entry: Omit<AdminAuditLog, "id" | "changedAt">,
+): void {
   const log = getAdminAuditLog();
   log.push({
     ...entry,
@@ -91,17 +101,37 @@ export function getDestinationBalances(): DestinationBalance {
   }
 }
 
-export function updateDestinationBalance(nameDest: string, balance: number): void {
+export function updateDestinationBalance(
+  nameDest: string,
+  balance: number,
+): void {
   const balances = getDestinationBalances();
   balances[nameDest] = balance;
-  localStorage.setItem(STORAGE_KEYS.DESTINATION_BALANCES, JSON.stringify(balances));
+  localStorage.setItem(
+    STORAGE_KEYS.DESTINATION_BALANCES,
+    JSON.stringify(balances),
+  );
 }
 
-// Origin Accounts
 export function getOriginAccounts(): OriginAccount[] {
   try {
     const data = localStorage.getItem(STORAGE_KEYS.ORIGIN_ACCOUNTS);
-    return data ? JSON.parse(data) : DEFAULT_ORIGIN_ACCOUNTS;
+    if (!data) return DEFAULT_ORIGIN_ACCOUNTS;
+
+    const storedAccounts = JSON.parse(data) as OriginAccount[];
+
+    // Merge with defaults to ensure displayName exists (migration for old data)
+    return storedAccounts.map((account) => {
+      const defaultAccount = DEFAULT_ORIGIN_ACCOUNTS.find(
+        (d) => d.id === account.id,
+      );
+      return {
+        ...account,
+        displayName:
+          account.displayName || defaultAccount?.displayName || account.name,
+        name: account.name || defaultAccount?.name || account.id,
+      };
+    });
   } catch {
     return DEFAULT_ORIGIN_ACCOUNTS;
   }
@@ -109,10 +139,13 @@ export function getOriginAccounts(): OriginAccount[] {
 
 export function updateOriginAccount(id: string, balance: number): void {
   const accounts = getOriginAccounts();
-  const index = accounts.findIndex(a => a.id === id);
+  const index = accounts.findIndex((a) => a.id === id);
   if (index !== -1) {
     accounts[index].balance = balance;
-    localStorage.setItem(STORAGE_KEYS.ORIGIN_ACCOUNTS, JSON.stringify(accounts));
+    localStorage.setItem(
+      STORAGE_KEYS.ORIGIN_ACCOUNTS,
+      JSON.stringify(accounts),
+    );
   }
 }
 
@@ -132,7 +165,10 @@ export function setLastStep(step: number): void {
 
 // Pending Transaction (for result page)
 export function setPendingTransaction(transaction: Transaction): void {
-  localStorage.setItem(STORAGE_KEYS.PENDING_TRANSACTION, JSON.stringify(transaction));
+  localStorage.setItem(
+    STORAGE_KEYS.PENDING_TRANSACTION,
+    JSON.stringify(transaction),
+  );
 }
 
 export function getPendingTransaction(): Transaction | null {
@@ -151,25 +187,51 @@ export function clearPendingTransaction(): void {
 // Export data
 export function exportTransactions(format: "json" | "csv"): string {
   const transactions = getTransactions();
-  
+
   if (format === "json") {
     return JSON.stringify(transactions, null, 2);
   }
-  
+
   // CSV format
   if (transactions.length === 0) return "";
-  
+
   const headers = [
-    "step", "type", "amount", "nameOrig", "oldbalanceOrg", "newbalanceOrig",
-    "nameDest", "oldbalanceDest", "newbalanceDest", "isFraud", "isFlaggedFraud",
-    "riskScore", "decision", "reasons", "createdAt"
+    "step",
+    "type",
+    "amount",
+    "nameOrig",
+    "oldbalanceOrg",
+    "newbalanceOrig",
+    "nameDest",
+    "oldbalanceDest",
+    "newbalanceDest",
+    "isFraud",
+    "isFlaggedFraud",
+    "riskScore",
+    "decision",
+    "reasons",
+    "createdAt",
   ];
-  
-  const rows = transactions.map(t => [
-    t.step, t.type, t.amount, t.nameOrig, t.oldbalanceOrg, t.newbalanceOrig,
-    t.nameDest, t.oldbalanceDest, t.newbalanceDest, t.isFraud, t.isFlaggedFraud,
-    t.riskScore.toFixed(4), t.decision, `"${t.reasons.join("; ")}"`, t.createdAt
-  ].join(","));
-  
+
+  const rows = transactions.map((t) =>
+    [
+      t.step,
+      t.type,
+      t.amount,
+      t.nameOrig,
+      t.oldbalanceOrg,
+      t.newbalanceOrig,
+      t.nameDest,
+      t.oldbalanceDest,
+      t.newbalanceDest,
+      t.isFraud,
+      t.isFlaggedFraud,
+      t.riskScore.toFixed(4),
+      t.decision,
+      `"${t.reasons.join("; ")}"`,
+      t.createdAt,
+    ].join(","),
+  );
+
   return [headers.join(","), ...rows].join("\n");
 }

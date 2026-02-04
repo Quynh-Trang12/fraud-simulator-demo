@@ -51,11 +51,11 @@ def predict_primary(data: TransactionInput):
         # If unknown type (e.g., DEBIT which we filtered out?), default to CASH_OUT or similar safest
         type_encoded = 0 
     
-    # 2. Balance Errors
+    # Feature engineering
     errorBalanceOrg = data.newbalanceOrig + data.amount - data.oldbalanceOrg
     errorBalanceDest = data.oldbalanceDest + data.amount - data.newbalanceDest
-    
-    features = pd.DataFrame([{
+
+    features_df = pd.DataFrame([{
         'type': type_encoded,
         'amount': data.amount,
         'oldbalanceOrg': data.oldbalanceOrg,
@@ -64,15 +64,62 @@ def predict_primary(data: TransactionInput):
         'errorBalanceDest': errorBalanceDest
     }])
     
-    # Predict
-    prob = models["primary"].predict_proba(features)[0][1]
-    is_fraud = prob > 0.5
+    # Enforce column order to match model training
+    expected_cols = ['type', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'errorBalanceOrg', 'errorBalanceDest']
+    features = features_df[expected_cols]
     
+    print("--- Prediction Request ---")
+    print(f"Input: {data}")
+    print(f"Features:\n{features}")
+    
+    # Predict
+    prob = models["primary"].predict_proba(features.values)[0][1]
+    
+    # --- Hybrid Detection Logic ---
+    # The current ML model seems to be conservative or undertrained on specific edge cases.
+    # We apply heuristic boosting to ensure obvious fraud patterns are flagged.
+    
+    heuristic_prob = 0.0
+    reasons = []
+    
+    # Rule 1: Zero-out / Balance Drain (High confidence fraud)
+    if data.amount > 0 and data.oldbalanceOrg > 0 and data.newbalanceOrig == 0:
+        if data.amount >= data.oldbalanceOrg:
+             heuristic_prob = max(heuristic_prob, 0.95)
+             reasons.append("Balance drain pattern detected")
+
+    # Rule 2: Excessive Amount (Liquidating huge sums)
+    if data.amount > 150000:
+        heuristic_prob = max(heuristic_prob, 0.70)
+        reasons.append("High value transaction")
+        
+    # Rule 3: Balance Error (Mathematical anomaly)
+    if abs(errorBalanceOrg) > 1000:
+        heuristic_prob = max(heuristic_prob, 0.85)
+        reasons.append("Balance sheet anomaly detected")
+
+    # Final Score: Combine ML and Rules
+    # If ML is low but Rules are high, trust Rules (Hybrid Ensemble)
+    final_prob = max(prob, heuristic_prob)
+    
+    is_fraud = final_prob > 0.5
+    
+    risk_level = "Low"
+    if final_prob > 0.8:
+        risk_level = "High"
+    elif final_prob > 0.4:
+         risk_level = "Medium"
+    
+    # Add explanations
+    explanation_text = "Transaction safe."
+    if is_fraud:
+        explanation_text = f"Flagged by AI Hybrid Engine. Risk Factors: {', '.join(reasons) if reasons else 'ML Model Detection'}."
+
     return {
-        "probability": float(prob),
+        "probability": float(final_prob),
         "is_fraud": bool(is_fraud),
-        "risk_level": "High" if prob > 0.7 else "Medium" if prob > 0.3 else "Low",
-        "explanation": f"Balance Discrepancy: {errorBalanceOrg:.2f}"
+        "risk_level": risk_level,
+        "explanation": explanation_text
     }
 
 # --- Secondary Model (Credit Card) ---

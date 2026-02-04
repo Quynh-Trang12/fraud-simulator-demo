@@ -7,14 +7,30 @@ interface RiskScoreProps {
   size?: "sm" | "md" | "lg";
 }
 
-export function RiskScore({ score, showBar = true, size = "md" }: RiskScoreProps) {
-  const percentage = Math.round(score * 100);
-  const level = getRiskLevel(score);
+export function RiskScore({
+  score,
+  showBar = true,
+  size = "md",
+}: RiskScoreProps) {
+  const percentage = Math.round(score);
+  const level = getRiskLevel(score / 100);
 
   const levelConfig = {
-    low: { label: "Low Risk", className: "text-success", barClass: "bg-success" },
-    medium: { label: "Medium Risk", className: "text-warning", barClass: "bg-warning" },
-    high: { label: "High Risk", className: "text-danger", barClass: "bg-danger" },
+    low: {
+      label: "Low Risk",
+      className: "text-success",
+      barClass: "bg-success",
+    },
+    medium: {
+      label: "Medium Risk",
+      className: "text-warning",
+      barClass: "bg-warning",
+    },
+    high: {
+      label: "High Risk",
+      className: "text-danger",
+      barClass: "bg-danger",
+    },
   };
 
   const config = levelConfig[level];
@@ -28,7 +44,9 @@ export function RiskScore({ score, showBar = true, size = "md" }: RiskScoreProps
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between gap-2">
-        <span className={cn("font-semibold", textSizes[size], config.className)}>
+        <span
+          className={cn("font-semibold", textSizes[size], config.className)}
+        >
           {percentage}%
         </span>
         <span className={cn("text-xs", config.className)} role="status">
@@ -36,7 +54,7 @@ export function RiskScore({ score, showBar = true, size = "md" }: RiskScoreProps
         </span>
       </div>
       {showBar && (
-        <div 
+        <div
           className="h-2 bg-muted rounded-full overflow-hidden"
           role="progressbar"
           aria-valuenow={percentage}
@@ -45,7 +63,10 @@ export function RiskScore({ score, showBar = true, size = "md" }: RiskScoreProps
           aria-label={`Risk score: ${percentage}%`}
         >
           <div
-            className={cn("h-full rounded-full transition-all duration-500", config.barClass)}
+            className={cn(
+              "h-full rounded-full transition-all duration-500",
+              config.barClass,
+            )}
             style={{ width: `${percentage}%` }}
           />
         </div>
