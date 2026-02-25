@@ -179,14 +179,21 @@ def _compute_heuristics(
         )
 
     # Rule 3: Balance-error anomaly (math inconsistency)
-    if abs(error_balance_org) > BALANCE_ERROR_EPSILON:
-        h_prob = max(h_prob, 0.85)
-        factors.append(
-            RiskFactor(
-                factor=f"Balance Discrepancy: Error of {error_balance_org:,.2f} detected (expected ≈ 0)",
-                severity="warning",
+    # Only evaluate balance drop inconsistencies for outgoing types
+    if data.type.replace("_", " ").upper() in [
+        "CASH OUT",
+        "TRANSFER",
+        "DEBIT",
+        "PAYMENT",
+    ]:
+        if abs(error_balance_org) > BALANCE_ERROR_EPSILON:
+            h_prob = max(h_prob, 0.85)
+            factors.append(
+                RiskFactor(
+                    factor=f"Balance Discrepancy: Error of {error_balance_org:,.2f} detected (expected ≈ 0)",
+                    severity="warning",
+                )
             )
-        )
 
     # Rule 4: High-value transaction
     if data.amount > HIGH_VALUE_AMOUNT:
@@ -202,6 +209,7 @@ def _compute_heuristics(
     if data.oldbalanceOrg > 0:
         ratio = data.amount / data.oldbalanceOrg
         if ratio > 0.9:
+            h_prob = max(h_prob, 0.60)
             factors.append(
                 RiskFactor(
                     factor=f"High Amount-to-Balance Ratio: {ratio:.1%} of available balance",
@@ -245,8 +253,17 @@ async def predict_primary(data: TransactionInput) -> PredictionOutput:
         # Unknown type (e.g. DEBIT, PAYMENT not in encoder) — default to 0
         type_encoded = 0
 
-    error_balance_org = data.newbalanceOrig + data.amount - data.oldbalanceOrg
-    error_balance_dest = data.oldbalanceDest + data.amount - data.newbalanceDest
+    tx_type = data.type.replace("_", " ").upper()
+
+    # Balance error math depends on transaction direction
+    if tx_type == "CASH IN":
+        # Money enters Origin: new should be old + amount
+        error_balance_org = data.newbalanceOrig - data.amount - data.oldbalanceOrg
+        error_balance_dest = data.oldbalanceDest + data.amount - data.newbalanceDest
+    else:
+        # Money leaves Origin: new should be old - amount
+        error_balance_org = data.newbalanceOrig + data.amount - data.oldbalanceOrg
+        error_balance_dest = data.oldbalanceDest + data.amount - data.newbalanceDest
 
     features = pd.DataFrame(
         [
@@ -263,24 +280,31 @@ async def predict_primary(data: TransactionInput) -> PredictionOutput:
 
     logger.debug("Prediction features:\n%s", features.to_string())
 
-    # ML prediction
-    ml_prob: float = float(_models["primary"].predict_proba(features.values)[0][1])
+    # ML prediction with safe fallback for unexpected float behavior
+    try:
+        raw_prob = _models["primary"].predict_proba(features.values)[0][1]
+        ml_prob = float(raw_prob)
+        if np.isnan(ml_prob):
+            ml_prob = 0.0
+    except Exception as e:
+        logger.error("XGBoost prediction failed: %s", e)
+        ml_prob = 0.0
 
     # Heuristic overlay
     h_prob, risk_factors = _compute_heuristics(data, error_balance_org)
 
-    # Add ML-specific factor if ML score is elevated
+    # Add ML-specific factor if ML score is elevated (clamp ml_prob to 0-1 for display)
     if ml_prob > 0.5:
         risk_factors.insert(
             0,
             RiskFactor(
-                factor=f"AI Model: XGBoost detected suspicious pattern (confidence: {ml_prob:.1%})",
+                factor=f"AI Model: XGBoost detected suspicious pattern (confidence: {min(1.0, ml_prob):.1%})",
                 severity="danger" if ml_prob > 0.8 else "warning",
             ),
         )
 
-    # Ensemble: take the max of ML and heuristic scores
-    final_prob = max(ml_prob, h_prob)
+    # Ensemble: take the max of ML and heuristic scores, strictly clamped to [0.0, 1.0]
+    final_prob = max(0.0, min(1.0, float(max(ml_prob, h_prob))))
     is_fraud = final_prob > 0.5
 
     # Risk level classification
@@ -375,8 +399,16 @@ async def predict_secondary(data: CreditCardInput) -> PredictionOutput:
         ]
     )
 
-    pred = int(_models["secondary_rf"].predict(features)[0])
-    prob = float(_models["secondary_rf"].predict_proba(features)[0][1])
+    try:
+        pred = int(_models["secondary_rf"].predict(features)[0])
+        raw_prob = _models["secondary_rf"].predict_proba(features)[0][1]
+        prob = max(0.0, min(1.0, float(raw_prob)))
+        if np.isnan(prob):
+            prob = 0.0
+    except Exception as e:
+        logger.error("Secondary RF prediction failed: %s", e)
+        pred = 0
+        prob = 0.0
 
     risk_factors: List[RiskFactor] = []
     if dist > 100:

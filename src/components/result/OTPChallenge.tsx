@@ -60,7 +60,7 @@ export function OTPChallenge({ onSuccess, onFail }: OTPChallengeProps) {
     if (otp === DEMO_OTP) {
       setStatus("success");
       if (timerRef.current) clearInterval(timerRef.current);
-      onSuccess();
+      setTimeout(() => onSuccess(), 2000);
     } else {
       setAttempts(prev => prev + 1);
       setOtp("");

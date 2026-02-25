@@ -30,7 +30,10 @@ import {
 } from "lucide-react";
 
 // Generate human-readable explanations for risk factors
-function generateExplainability(transaction: Transaction): {
+function generateExplainability(
+  transaction: Transaction,
+  displayDecision: Decision,
+): {
   icon: React.ElementType;
   text: string;
   severity: "info" | "warning" | "danger";
@@ -142,7 +145,10 @@ function generateExplainability(transaction: Transaction): {
   });
 
   // If approved, strictly limit negative explanations to avoid confusion
-  if (transaction.decision === "APPROVE") {
+  if (
+    displayDecision === "APPROVE" ||
+    displayDecision === "APPROVE_AFTER_STEPUP"
+  ) {
     const criticalFactors = filteredExplanations.filter(
       (e) => e.severity === "info",
     );
@@ -223,7 +229,7 @@ export default function Result() {
   }
 
   const displayDecision = finalDecision || transaction.decision;
-  const explanations = generateExplainability(transaction);
+  const explanations = generateExplainability(transaction, displayDecision);
 
   // Get friendly account name
   const originAccount = DEFAULT_ORIGIN_ACCOUNTS.find(
