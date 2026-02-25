@@ -1,182 +1,403 @@
+"""
+AnomalyWatchers-DonutPuff — FastAPI Backend
+============================================
+COS30049 Assignment 3: Full-Stack Fraud Detection API
+
+Architecture:
+    - Models loaded ONCE at startup via ``@app.on_event("startup")``.
+    - Prediction endpoints are ``async def`` for non-blocking I/O.
+    - Hybrid detection: ML probability ensembled with heuristic rules.
+    - Structured XAI: returns typed ``RiskFactor`` objects for frontend display.
+
+Endpoints:
+    GET  /                    → health check
+    POST /predict/primary     → Paysim (Rupak Roy) model
+    POST /predict/secondary   → Sparkov (Kartik2112) model
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List
+
+import joblib
+import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import joblib
-import pandas as pd
-import numpy as np
-import os
-from .schemas import TransactionInput, CreditCardInput, PredictionOutput
-from math import radians, cos, sin, asin, sqrt
 
-app = FastAPI(title="Fraud Simulator API", version="1.0")
+from .schemas import PredictionOutput, RiskFactor, TransactionInput, CreditCardInput
 
-# CORS
+# ---------------------------------------------------------------------------
+# Logging (Rule 8)
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("anomaly_watchers.api")
+
+# ---------------------------------------------------------------------------
+# Constants (Rule 5)
+# ---------------------------------------------------------------------------
+MODEL_DIR = Path("backend") / "models"
+
+FEATURE_COLUMNS: List[str] = [
+    "type",
+    "amount",
+    "oldbalanceOrg",
+    "newbalanceOrig",
+    "errorBalanceOrg",
+    "errorBalanceDest",
+]
+
+# Risk-level thresholds
+HIGH_RISK_THRESHOLD: float = 0.8
+MEDIUM_RISK_THRESHOLD: float = 0.4
+
+# Heuristic thresholds
+HIGH_VALUE_AMOUNT: float = 150_000.0
+BALANCE_ERROR_EPSILON: float = 0.01
+
+# ---------------------------------------------------------------------------
+# Global model registry — populated at startup, read-only thereafter
+# ---------------------------------------------------------------------------
+_models: Dict[str, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (modern replacement for on_event)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load ML models into memory once at application startup."""
+    logger.info("Loading models from %s ...", MODEL_DIR)
+
+    artifact_map = {
+        "primary": "model_primary.pkl",
+        "encoder": "label_encoder_type.pkl",
+        "logistic": "model_logistic.pkl",
+        "isolation_forest": "model_isolation_forest.pkl",
+        "secondary_rf": "model_secondary_rf.pkl",
+    }
+
+    for key, filename in artifact_map.items():
+        path = MODEL_DIR / filename
+        if path.exists():
+            _models[key] = joblib.load(path)
+            logger.info("   ✓ Loaded %s", filename)
+        else:
+            logger.warning("   ✗ Missing %s — endpoint will return 503", filename)
+
+    logger.info("Models loaded: %s", list(_models.keys()))
+    yield
+    logger.info("Shutting down — releasing model references")
+    _models.clear()
+
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="AnomalyWatchers Fraud Detection API",
+    version="2.0.0",
+    description="Tri-model fraud detection with XAI explainability",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:8080", "http://localhost:8081"], # Vite default & alternatives
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8080",
+        "http://localhost:8081",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global Models
-models = {}
 
-@app.on_event("startup")
-def load_models():
-    model_dir = "backend/models"
-    try:
-        models["primary"] = joblib.load(os.path.join(model_dir, "model_primary.pkl"))
-        models["encoder"] = joblib.load(os.path.join(model_dir, "label_encoder_type.pkl"))
-        models["secondary_rf"] = joblib.load(os.path.join(model_dir, "model_secondary_rf.pkl"))
-        # models["secondary_iso"] = joblib.load(os.path.join(model_dir, "model_secondary_iso.pkl"))
-        print("Models loaded successfully.")
-    except Exception as e:
-        print(f"Error loading models: {e}")
-
+# ---------------------------------------------------------------------------
+# Health Check
+# ---------------------------------------------------------------------------
 @app.get("/")
-def health_check():
-    return {"status": "ok", "models_loaded": list(models.keys())}
+async def health_check() -> Dict[str, Any]:
+    """Return API status and list of loaded model keys."""
+    return {"status": "ok", "models_loaded": list(_models.keys())}
 
-# --- Primary Model (Mobile Money) ---
-@app.post("/predict/primary", response_model=PredictionOutput)
-def predict_primary(data: TransactionInput):
-    if "primary" not in models:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    # Feature Engineering (Must match training script)
-    # 1. Type Encoding
-    try:
-        type_encoded = models["encoder"].transform([data.type])[0]
-    except:
-        # If unknown type (e.g., DEBIT which we filtered out?), default to CASH_OUT or similar safest
-        type_encoded = 0 
-    
-    # Feature engineering
-    errorBalanceOrg = data.newbalanceOrig + data.amount - data.oldbalanceOrg
-    errorBalanceDest = data.oldbalanceDest + data.amount - data.newbalanceDest
 
-    features_df = pd.DataFrame([{
-        'type': type_encoded,
-        'amount': data.amount,
-        'oldbalanceOrg': data.oldbalanceOrg,
-        'newbalanceOrig': data.newbalanceOrig,
-        'errorBalanceOrg': errorBalanceOrg,
-        'errorBalanceDest': errorBalanceDest
-    }])
-    
-    # Enforce column order to match model training
-    expected_cols = ['type', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'errorBalanceOrg', 'errorBalanceDest']
-    features = features_df[expected_cols]
-    
-    print("--- Prediction Request ---")
-    print(f"Input: {data}")
-    print(f"Features:\n{features}")
-    
-    # Predict
-    prob = models["primary"].predict_proba(features.values)[0][1]
-    
-    print(f"ML Probability: {prob:.4f}")
-    
-    # --- Hybrid Detection Logic ---
-    # Combine ML score with heuristic rules for specific fraud patterns
-    # that might be undersampled in the training data (e.g., forced overdrafts).
-    
-    heuristic_prob = 0.0
-    reasons = []
-    
-    # Rule 1: Forced Overdraft (Negative Balance)
-    # This specifically catches the "High Risk" preset where Amount > Balance
+# ---------------------------------------------------------------------------
+# Heuristic Engine (XAI)
+# ---------------------------------------------------------------------------
+def _compute_heuristics(
+    data: TransactionInput,
+    error_balance_org: float,
+) -> tuple[float, List[RiskFactor]]:
+    """
+    Rule-based fraud heuristics that complement the ML model.
+
+    Returns the maximum heuristic probability and a list of
+    :class:`RiskFactor` objects for the frontend XAI display.
+
+    Args:
+        data: Validated transaction input.
+        error_balance_org: Computed balance-error feature.
+
+    Returns:
+        Tuple of (heuristic_probability, risk_factors).
+    """
+    h_prob: float = 0.0
+    factors: List[RiskFactor] = []
+
+    # Rule 1: Forced overdraft — newbalanceOrig should never be negative
     if data.newbalanceOrig < 0:
-         heuristic_prob = max(heuristic_prob, 0.99)
-         reasons.append("Illegal Overdraft (Negative Balance) detected")
+        h_prob = max(h_prob, 0.99)
+        factors.append(
+            RiskFactor(
+                factor="Illegal Overdraft: Sender balance went negative, indicating a forced withdrawal",
+                severity="danger",
+            )
+        )
 
-    # Rule 2: Zero-out / Balance Drain
-    # If balance hits exactly 0, check if it was a total drain
-    elif data.newbalanceOrig == 0 and data.amount > 0:
-        if data.amount >= data.oldbalanceOrg:
-             heuristic_prob = max(heuristic_prob, 0.95)
-             reasons.append("Balance drain pattern detected")
+    # Rule 2: Complete balance drain
+    if (
+        data.newbalanceOrig == 0
+        and data.amount > 0
+        and data.amount >= data.oldbalanceOrg
+    ):
+        h_prob = max(h_prob, 0.95)
+        factors.append(
+            RiskFactor(
+                factor=f"Balance Drain: Full account emptied ({data.oldbalanceOrg:,.2f} → 0)",
+                severity="danger",
+            )
+        )
 
-    # Rule 3: Balance Error (Mathematical anomaly = Potential Exploit)
-    # Standard check: new + amount - old should be 0 (for drain) or diff
-    # But for Overdraft, the math IS valid (50k - 99k = -49k), so Rule 1 catches it.
-    if abs(errorBalanceOrg) > 0.01:
-        # If the math doesn't add up (e.g. overdrafting more than balance), flag it
-        heuristic_prob = max(heuristic_prob, 0.85)
-        reasons.append(f"Balance discrepancy ({errorBalanceOrg:.2f})")
+    # Rule 3: Balance-error anomaly (math inconsistency)
+    if abs(error_balance_org) > BALANCE_ERROR_EPSILON:
+        h_prob = max(h_prob, 0.85)
+        factors.append(
+            RiskFactor(
+                factor=f"Balance Discrepancy: Error of {error_balance_org:,.2f} detected (expected ≈ 0)",
+                severity="warning",
+            )
+        )
 
-    # Rule 4: High Value
-    if data.amount > 150000:
-        heuristic_prob = max(heuristic_prob, 0.70)
-        reasons.append("High value transaction")
+    # Rule 4: High-value transaction
+    if data.amount > HIGH_VALUE_AMOUNT:
+        h_prob = max(h_prob, 0.70)
+        factors.append(
+            RiskFactor(
+                factor=f"High Amount: {data.amount:,.2f} exceeds {HIGH_VALUE_AMOUNT:,.0f} threshold",
+                severity="warning",
+            )
+        )
 
-    # Final Score: Ensemble (Max of ML and Rules)
-    final_prob = max(prob, heuristic_prob)
-    
-    # --- Risk Assessment ---
+    # Rule 5: Amount > old balance ratio (suspicious overdraw attempt)
+    if data.oldbalanceOrg > 0:
+        ratio = data.amount / data.oldbalanceOrg
+        if ratio > 0.9:
+            factors.append(
+                RiskFactor(
+                    factor=f"High Amount-to-Balance Ratio: {ratio:.1%} of available balance",
+                    severity="warning",
+                )
+            )
+
+    return h_prob, factors
+
+
+# ---------------------------------------------------------------------------
+# Primary Prediction Endpoint (Paysim / Rupak Roy)
+# ---------------------------------------------------------------------------
+@app.post("/predict/primary", response_model=PredictionOutput)
+async def predict_primary(data: TransactionInput) -> PredictionOutput:
+    """
+    Run fraud detection on a Paysim-schema transaction.
+
+    Combines XGBoost ML probability with heuristic rules.
+    Returns structured XAI factors for the frontend.
+
+    Args:
+        data: Validated :class:`TransactionInput`.
+
+    Returns:
+        :class:`PredictionOutput` with probability, decision, and XAI factors.
+
+    Raises:
+        HTTPException 503: If the primary model is not loaded.
+    """
+    if "primary" not in _models:
+        raise HTTPException(
+            status_code=503,
+            detail="Primary model not loaded. Run `python scripts/train_models.py` first.",
+        )
+
+    # Feature engineering — must mirror the training pipeline exactly
+    try:
+        type_encoded = int(_models["encoder"].transform([data.type])[0])
+    except (ValueError, KeyError):
+        # Unknown type (e.g. DEBIT, PAYMENT not in encoder) — default to 0
+        type_encoded = 0
+
+    error_balance_org = data.newbalanceOrig + data.amount - data.oldbalanceOrg
+    error_balance_dest = data.oldbalanceDest + data.amount - data.newbalanceDest
+
+    features = pd.DataFrame(
+        [
+            {
+                "type": type_encoded,
+                "amount": data.amount,
+                "oldbalanceOrg": data.oldbalanceOrg,
+                "newbalanceOrig": data.newbalanceOrig,
+                "errorBalanceOrg": error_balance_org,
+                "errorBalanceDest": error_balance_dest,
+            }
+        ]
+    )[FEATURE_COLUMNS]
+
+    logger.debug("Prediction features:\n%s", features.to_string())
+
+    # ML prediction
+    ml_prob: float = float(_models["primary"].predict_proba(features.values)[0][1])
+
+    # Heuristic overlay
+    h_prob, risk_factors = _compute_heuristics(data, error_balance_org)
+
+    # Add ML-specific factor if ML score is elevated
+    if ml_prob > 0.5:
+        risk_factors.insert(
+            0,
+            RiskFactor(
+                factor=f"AI Model: XGBoost detected suspicious pattern (confidence: {ml_prob:.1%})",
+                severity="danger" if ml_prob > 0.8 else "warning",
+            ),
+        )
+
+    # Ensemble: take the max of ML and heuristic scores
+    final_prob = max(ml_prob, h_prob)
     is_fraud = final_prob > 0.5
-    
-    risk_level = "Low"
-    if final_prob > 0.8:
+
+    # Risk level classification
+    if final_prob > HIGH_RISK_THRESHOLD:
         risk_level = "High"
-    elif final_prob > 0.4:
+    elif final_prob > MEDIUM_RISK_THRESHOLD:
         risk_level = "Medium"
-    
-    # Generate explanations
-    # Use the ML reasons if ML score is high, otherwise use Rule reasons
-    ml_reasons = []
-    if prob > 0.5:
-        ml_reasons.append("AI Model detected suspicious pattern")
-    
-    all_reasons = list(set(reasons + ml_reasons))
-    
-    explanation_text = "Transaction appears safe." if not is_fraud else f"Risk Factors: {', '.join(all_reasons)}."
+    else:
+        risk_level = "Low"
 
-    return {
-        "probability": float(prob),
-        "is_fraud": bool(is_fraud),
-        "risk_level": risk_level,
-        "explanation": explanation_text
-    }
+    # Generate human-readable summary
+    if is_fraud:
+        factor_summaries = [f.factor for f in risk_factors[:3]]
+        explanation = f"Risk Factors: {'; '.join(factor_summaries)}."
+    else:
+        explanation = "Transaction parameters are consistent with legitimate behavior."
+        if not risk_factors:
+            risk_factors.append(
+                RiskFactor(
+                    factor="All checks passed — no anomalies detected",
+                    severity="info",
+                )
+            )
 
-# --- Secondary Model (Credit Card) ---
-def haversine(lon1, lat1, lon2, lat2):
+    logger.info(
+        "Predict | type=%s amount=%.2f | ML=%.4f heuristic=%.4f → %s (%s)",
+        data.type,
+        data.amount,
+        ml_prob,
+        h_prob,
+        risk_level,
+        "FRAUD" if is_fraud else "LEGIT",
+    )
+
+    return PredictionOutput(
+        probability=float(final_prob),
+        is_fraud=is_fraud,
+        risk_level=risk_level,
+        explanation=explanation,
+        risk_factors=risk_factors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Secondary Prediction Endpoint (Kartik2112 / Sparkov)
+# ---------------------------------------------------------------------------
+def _haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Haversine formula for great-circle distance in km."""
     lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1 
-    dlat = lat2 - lat1 
-    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-    c = 2 * np.arcsin(np.sqrt(a)) 
-    r = 6371 
-    return c * r
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return float(6371 * 2 * np.arcsin(np.sqrt(a)))
+
 
 @app.post("/predict/secondary", response_model=PredictionOutput)
-def predict_secondary(data: CreditCardInput):
-    if "secondary_rf" not in models:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+async def predict_secondary(data: CreditCardInput) -> PredictionOutput:
+    """
+    Run fraud detection on a Kartik2112-schema credit card transaction.
 
-    # Feature Engineering
-    dist = haversine(data.long, data.lat, data.merch_long, data.merch_lat)
-    
+    Args:
+        data: Validated :class:`CreditCardInput`.
+
+    Returns:
+        :class:`PredictionOutput`.
+
+    Raises:
+        HTTPException 503: If the secondary model is not loaded.
+    """
+    if "secondary_rf" not in _models:
+        raise HTTPException(
+            status_code=503,
+            detail="Secondary model not loaded. Run `python scripts/train_models.py` first.",
+        )
+
+    dist = _haversine(data.long, data.lat, data.merch_long, data.merch_lat)
+
     try:
-        data_dob = pd.to_datetime(data.dob)
-        age = 2020 - data_dob.year
-    except:
-        age = 30 # default
-        
-    features = pd.DataFrame([{
-        'amt': data.amt,
-        'dist_to_merch': dist,
-        'age': age,
-        'city_pop': data.city_pop
-    }])
-    
-    # Predict
-    pred = models["secondary_rf"].predict(features)[0]
-    prob = models["secondary_rf"].predict_proba(features)[0][1]
-    
-    return {
-        "probability": float(prob),
-        "is_fraud": bool(pred),
-        "risk_level": "High" if prob > 0.7 else "Medium" if prob > 0.3 else "Low",
-        "explanation": f"Distance: {dist:.2f}km"
-    }
+        dob_parsed = pd.to_datetime(data.dob)
+        age = 2025 - dob_parsed.year
+    except (ValueError, TypeError):
+        age = 30  # safe default
+
+    features = pd.DataFrame(
+        [
+            {
+                "amt": data.amt,
+                "dist_to_merch": dist,
+                "age": age,
+                "city_pop": data.city_pop,
+            }
+        ]
+    )
+
+    pred = int(_models["secondary_rf"].predict(features)[0])
+    prob = float(_models["secondary_rf"].predict_proba(features)[0][1])
+
+    risk_factors: List[RiskFactor] = []
+    if dist > 100:
+        risk_factors.append(
+            RiskFactor(
+                factor=f"Distance anomaly: {dist:.1f} km from merchant",
+                severity="warning",
+            )
+        )
+
+    if prob > HIGH_RISK_THRESHOLD:
+        risk_level = "High"
+    elif prob > MEDIUM_RISK_THRESHOLD:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
+
+    return PredictionOutput(
+        probability=prob,
+        is_fraud=bool(pred),
+        risk_level=risk_level,
+        explanation=f"Distance to merchant: {dist:.2f} km",
+        risk_factors=risk_factors,
+    )

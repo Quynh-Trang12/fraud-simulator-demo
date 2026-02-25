@@ -1,414 +1,621 @@
 """
-AnomalyWatchers - ML Pipeline Training Script
-Assignment 2: Tri-Model Fraud Detection Architecture
+AnomalyWatchers-DonutPuff — Unified ML Pipeline
+=================================================
+COS30049 Assignment 2: Tri-Model Fraud Detection Architecture
 
-This script implements:
-1. Data Engineering (Loading, Preprocessing, SMOTE)
-2. Feature Engineering (Error features, Ratios)
-3. Tri-Model Training (Logistic Regression, XGBoost, Isolation Forest)
-4. Evaluation (AUPRC, Confusion Matrix, SHAP)
-5. Model Serialization
+Pipeline:
+    Phase 1  ─  Data Engineering  (Load, dtype-optimize, stratified sample)
+    Phase 2  ─  Feature Engineering  (error-balance features, label encoding)
+    Phase 3  ─  Imbalance Handling  (SMOTE with documented justification)
+    Phase 4  ─  Tri-Model Training
+                  ├── Model 1: Logistic Regression  (Baseline)
+                  ├── Model 2: XGBoost Classifier   (Champion, GridSearchCV)
+                  └── Model 3: Isolation Forest      (Unsupervised anomaly)
+    Phase 5  ─  Evaluation  (AUPRC, Confusion Matrix, Classification Report)
+    Phase 6  ─  Serialization  (joblib → backend/models/)
+
+Datasets:
+    Primary  (Trainer)  : Rupak Roy  — Online Payments Fraud Detection (Paysim)
+    Secondary (Validator): Kartik2112 — Fraud Detection (credit-card domain)
+
+Usage:
+    python scripts/train_models.py [--sample-frac 0.1] [--full]
+
+Authors: AnomalyWatchers (DonutPuff)
 """
 
+from __future__ import annotations
+
+import argparse
+import logging
 import os
 import sys
 import warnings
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import joblib
 import numpy as np
 import pandas as pd
-from datetime import datetime
-
-# ML Libraries
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    classification_report, 
-    confusion_matrix, 
-    precision_recall_curve,
     average_precision_score,
+    classification_report,
+    confusion_matrix,
     f1_score,
-    roc_auc_score
+    precision_recall_curve,
 )
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.preprocessing import LabelEncoder
 
-# XGBoost
 try:
     import xgboost as xgb
 except ImportError:
-    print("Installing XGBoost...")
-    os.system(f"{sys.executable} -m pip install xgboost")
-    import xgboost as xgb
+    raise SystemExit("[FATAL] XGBoost not installed. Run:  pip install xgboost")
 
-# SMOTE for imbalance handling (optional)
 try:
     from imblearn.over_sampling import SMOTE
-    SMOTE_AVAILABLE = True
 except ImportError:
-    print("Note: imbalanced-learn not available. Using class weights instead of SMOTE.")
-    SMOTE_AVAILABLE = False
+    raise SystemExit(
+        "[FATAL] imbalanced-learn not installed. Run:  pip install imbalanced-learn"
+    )
 
-warnings.filterwarnings('ignore')
+# ---------------------------------------------------------------------------
+# Logging Configuration (Rule 8: No print() — structured logging)
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("anomaly_watchers.pipeline")
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-DATA_DIR = "data"
-MODEL_DIR = "backend/models"
-PRIMARY_DATASET = os.path.join(DATA_DIR, "onlinefraud.csv")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# Features matching frontend schema
-FEATURE_COLUMNS = [
-    'type', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 
-    'errorBalanceOrg', 'errorBalanceDest'
+# ---------------------------------------------------------------------------
+# Constants (Rule 5: No magic numbers)
+# ---------------------------------------------------------------------------
+RANDOM_STATE: int = 42
+TEST_SIZE: float = 0.2
+
+FEATURE_COLUMNS: List[str] = [
+    "type",
+    "amount",
+    "oldbalanceOrg",
+    "newbalanceOrig",
+    "errorBalanceOrg",
+    "errorBalanceDest",
 ]
-TARGET_COLUMN = 'isFraud'
+TARGET_COLUMN: str = "isFraud"
 
-# ==============================================================================
-# PHASE 1: DATA ENGINEERING
-# ==============================================================================
+# Fraud-capable transaction types in the Paysim dataset
+FRAUD_CAPABLE_TYPES: List[str] = ["CASH_OUT", "TRANSFER"]
 
-def load_primary_dataset(filepath: str, sample_frac: float = 0.1) -> pd.DataFrame:
+# Paths
+DATA_DIR = Path("data")
+MODEL_DIR = Path("backend") / "models"
+PRIMARY_DATASET = DATA_DIR / "onlinefraud.csv"
+
+# dtype map for memory-efficient loading
+DTYPE_MAP = {
+    "step": "int32",
+    "type": "category",
+    "amount": "float32",
+    "nameOrig": "object",
+    "oldbalanceOrg": "float32",
+    "newbalanceOrig": "float32",
+    "nameDest": "object",
+    "oldbalanceDest": "float32",
+    "newbalanceDest": "float32",
+    "isFraud": "int8",
+    "isFlaggedFraud": "int8",
+}
+
+
+# ---------------------------------------------------------------------------
+# Data Transfer Objects (Rule 2: Immutable DTOs)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ModelResult:
+    """Immutable container for a single model's evaluation metrics."""
+
+    name: str
+    model: object
+    predictions: np.ndarray
+    probabilities: Optional[np.ndarray]
+    auprc: Optional[float]
+    f1: float
+    best_params: Optional[Dict] = field(default=None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Data Engineering
+# ---------------------------------------------------------------------------
+def load_primary_dataset(filepath: Path, sample_frac: float = 0.1) -> pd.DataFrame:
     """
-    Load the Rupak Roy (Paysim) dataset with memory optimization.
-    Uses sampling for faster development iterations.
+    Load the Rupak Roy (Paysim) dataset with memory-optimized dtypes.
+
+    Uses stratified sampling to preserve fraud/legit ratio when
+    ``sample_frac < 1.0`` (development mode).
+
+    Args:
+        filepath: Path to the ``onlinefraud.csv`` file.
+        sample_frac: Fraction of *legitimate* transactions to retain.
+                     All fraudulent rows are always kept.
+
+    Returns:
+        A pandas DataFrame ready for feature engineering.
+
+    Raises:
+        FileNotFoundError: If the CSV is missing from ``data/``.
     """
-    print(f"\n{'='*60}")
-    print("PHASE 1: DATA ENGINEERING")
-    print(f"{'='*60}")
-    
-    print(f"\n[1.1] Loading dataset: {filepath}")
-    
-    # Optimize dtypes for memory efficiency
-    dtype_map = {
-        'step': 'int32',
-        'type': 'category',
-        'amount': 'float32',
-        'nameOrig': 'object',
-        'oldbalanceOrg': 'float32',
-        'newbalanceOrig': 'float32',
-        'nameDest': 'object',
-        'oldbalanceDest': 'float32',
-        'newbalanceDest': 'float32',
-        'isFraud': 'int8',
-        'isFlaggedFraud': 'int8'
-    }
-    
-    df = pd.read_csv(filepath, dtype=dtype_map)
-    print(f"   Total records: {len(df):,}")
-    print(f"   Memory usage: {df.memory_usage().sum() / 1e6:.1f} MB")
-    
-    # Sample for faster training (remove this for production)
+    logger.info("=" * 60)
+    logger.info("PHASE 1: DATA ENGINEERING")
+    logger.info("=" * 60)
+
+    if not filepath.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {filepath}. "
+            "Run `python scripts/download_data.py` to fetch the CSV."
+        )
+
+    logger.info("[1.1] Loading dataset: %s", filepath)
+    df = pd.read_csv(filepath, dtype=DTYPE_MAP)
+    logger.info("   Total records: %s", f"{len(df):,}")
+    logger.info("   Memory usage: %.1f MB", df.memory_usage().sum() / 1e6)
+
+    # Stratified sampling — keep ALL fraud rows, sample legit rows
     if sample_frac < 1.0:
-        print(f"\n[1.2] Sampling {sample_frac*100:.0f}% of data for faster training...")
-        # Stratified sampling to maintain fraud ratio
-        df_fraud = df[df['isFraud'] == 1]
-        df_legit = df[df['isFraud'] == 0].sample(frac=sample_frac, random_state=42)
-        df = pd.concat([df_fraud, df_legit]).sample(frac=1, random_state=42).reset_index(drop=True)
-        print(f"   Sampled records: {len(df):,}")
-    
-    # Show class imbalance
-    fraud_rate = df['isFraud'].mean()
-    print(f"\n[1.3] Class Distribution:")
-    print(f"   Legitimate: {(1-fraud_rate)*100:.2f}%")
-    print(f"   Fraudulent: {fraud_rate*100:.4f}%")
-    
+        logger.info(
+            "[1.2] Stratified sampling %.0f%% of legit data...",
+            sample_frac * 100,
+        )
+        df_fraud = df[df[TARGET_COLUMN] == 1]
+        df_legit = df[df[TARGET_COLUMN] == 0].sample(
+            frac=sample_frac, random_state=RANDOM_STATE
+        )
+        df = (
+            pd.concat([df_fraud, df_legit])
+            .sample(frac=1, random_state=RANDOM_STATE)
+            .reset_index(drop=True)
+        )
+        logger.info("   Sampled records: %s", f"{len(df):,}")
+
+    fraud_rate = df[TARGET_COLUMN].mean()
+    logger.info("[1.3] Class Distribution:")
+    logger.info("   Legitimate: %.2f%%", (1 - fraud_rate) * 100)
+    logger.info("   Fraudulent: %.4f%%", fraud_rate * 100)
+
     return df
 
-# ==============================================================================
-# PHASE 2: FEATURE ENGINEERING
-# ==============================================================================
 
-def engineer_features(df: pd.DataFrame) -> tuple[pd.DataFrame, LabelEncoder]:
+# ---------------------------------------------------------------------------
+# Phase 2: Feature Engineering
+# ---------------------------------------------------------------------------
+def engineer_features(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, LabelEncoder]:
     """
-    Create features matching the frontend schema.
-    Implements the 'error' features that are critical for fraud detection.
+    Construct model-ready features from the raw Paysim data.
+
+    Key transforms:
+        * Filter to CASH_OUT / TRANSFER (only types with fraud).
+        * ``errorBalanceOrg``  = newbalanceOrig + amount − oldbalanceOrg
+        * ``errorBalanceDest`` = oldbalanceDest + amount − newbalanceDest
+        * Label-encode the ``type`` column.
+
+    Args:
+        df: Raw DataFrame from :func:`load_primary_dataset`.
+
+    Returns:
+        Tuple of (features DataFrame, fitted LabelEncoder).
     """
-    print(f"\n{'='*60}")
-    print("PHASE 2: FEATURE ENGINEERING")
-    print(f"{'='*60}")
-    
+    logger.info("=" * 60)
+    logger.info("PHASE 2: FEATURE ENGINEERING")
+    logger.info("=" * 60)
+
     df = df.copy()
-    
-    # Filter to only transaction types where fraud occurs
-    # (Fraud only happens in TRANSFER and CASH_OUT in Paysim)
-    print("\n[2.1] Filtering to relevant transaction types...")
-    df = df[df['type'].isin(['CASH_OUT', 'TRANSFER'])]
-    print(f"   Records after filtering: {len(df):,}")
-    
-    # Create Error Features (The "Secret Sauce")
-    # In legitimate transactions, these should be ~0
-    # In fraud, the balance math doesn't add up
-    print("\n[2.2] Creating Error Features...")
-    df['errorBalanceOrg'] = df['newbalanceOrig'] + df['amount'] - df['oldbalanceOrg']
-    df['errorBalanceDest'] = df['oldbalanceDest'] + df['amount'] - df['newbalanceDest']
-    
-    # Label Encode Transaction Type
-    print("\n[2.3] Encoding categorical features...")
+
+    # Filter to fraud-capable transaction types
+    logger.info("[2.1] Filtering to %s...", FRAUD_CAPABLE_TYPES)
+    df = df[df["type"].isin(FRAUD_CAPABLE_TYPES)]
+    logger.info("   Records after filter: %s", f"{len(df):,}")
+
+    # Error-balance features — key discriminators for fraud
+    # Why: In legitimate transactions these features ≈ 0; in fraud the
+    # balance math is inconsistent, producing non-zero error signals.
+    logger.info("[2.2] Creating error-balance features...")
+    df["errorBalanceOrg"] = df["newbalanceOrig"] + df["amount"] - df["oldbalanceOrg"]
+    df["errorBalanceDest"] = df["oldbalanceDest"] + df["amount"] - df["newbalanceDest"]
+
+    # Label encode transaction type
+    logger.info("[2.3] Label-encoding 'type'...")
     le_type = LabelEncoder()
-    df['type'] = le_type.fit_transform(df['type'])
-    print(f"   Type classes: {list(le_type.classes_)}")
-    
-    # Select only the features we need
-    print("\n[2.4] Selecting final feature set...")
+    df["type"] = le_type.fit_transform(df["type"])
+    logger.info("   Classes: %s", list(le_type.classes_))
+
+    # Final feature selection
     features = df[FEATURE_COLUMNS + [TARGET_COLUMN]].copy()
-    
-    # Check for missing values
     missing = features.isnull().sum().sum()
-    print(f"   Missing values: {missing}")
-    
+    logger.info(
+        "[2.4] Final feature set — %d columns, %d missing",
+        len(FEATURE_COLUMNS),
+        missing,
+    )
+
     return features, le_type
 
-# ==============================================================================
-# PHASE 3: TRI-MODEL ARCHITECTURE
-# ==============================================================================
 
-def train_models(X_train, X_test, y_train, y_test):
+# ---------------------------------------------------------------------------
+# Phase 3: Imbalance Handling (SMOTE)
+# ---------------------------------------------------------------------------
+def apply_smote(
+    X_train: np.ndarray, y_train: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Train the Tri-Model Architecture:
-    1. Logistic Regression (Baseline)
-    2. XGBoost (Champion)
-    3. Isolation Forest (Anomaly Detector)
+    Apply SMOTE (Synthetic Minority Over-sampling Technique) to balance
+    the training set.
+
+    Justification (Assignment 2 requirement):
+        The Rupak Roy dataset exhibits extreme class imbalance (~0.13% fraud).
+        SMOTE generates synthetic fraud examples by interpolating between
+        existing minority-class neighbours, preventing the model from
+        learning a trivial "always predict legit" strategy.  We apply SMOTE
+        *only* to training data to avoid data leakage into validation.
+
+    Args:
+        X_train: Feature matrix (train split only).
+        y_train: Target vector (train split only).
+
+    Returns:
+        Tuple of (X_resampled, y_resampled).
     """
-    print(f"\n{'='*60}")
-    print("PHASE 3: TRI-MODEL ARCHITECTURE")
-    print(f"{'='*60}")
-    
-    results = {}
-    
-    # -------------------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("PHASE 3: IMBALANCE HANDLING (SMOTE)")
+    logger.info("=" * 60)
+
+    logger.info("[3.0] Pre-SMOTE fraud ratio: %.4f%%", y_train.mean() * 100)
+
+    smote = SMOTE(random_state=RANDOM_STATE)
+    X_resampled, y_resampled = smote.fit_resample(X_train, y_train)
+
+    logger.info("[3.1] Post-SMOTE train size: %s", f"{len(X_resampled):,}")
+    logger.info(
+        "[3.2] Post-SMOTE fraud ratio: %.2f%%",
+        y_resampled.mean() * 100,
+    )
+
+    return X_resampled, y_resampled
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Tri-Model Architecture
+# ---------------------------------------------------------------------------
+def train_tri_models(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+) -> List[ModelResult]:
+    """
+    Train the three required models and return their results.
+
+    Models:
+        1. **Logistic Regression** (Baseline) — interpretable linear model.
+        2. **XGBoost** (Champion) — gradient-boosted trees with GridSearchCV.
+        3. **Isolation Forest** (Unsupervised) — anomaly detector.
+
+    Args:
+        X_train: Balanced training features.
+        X_test:  Hold-out test features.
+        y_train: Balanced training labels.
+        y_test:  Hold-out test labels.
+
+    Returns:
+        List of :class:`ModelResult` objects.
+    """
+    logger.info("=" * 60)
+    logger.info("PHASE 4: TRI-MODEL ARCHITECTURE")
+    logger.info("=" * 60)
+
+    results: List[ModelResult] = []
+
+    # ------------------------------------------------------------------
     # Model 1: Logistic Regression (Baseline)
-    # -------------------------------------------------------------------------
-    print("\n[3.1] Training Model 1: Logistic Regression (Baseline)")
+    # ------------------------------------------------------------------
+    logger.info("[4.1] Model 1 — Logistic Regression (Baseline)")
     lr = LogisticRegression(
-        class_weight='balanced',
+        class_weight="balanced",
         max_iter=1000,
-        random_state=42,
-        solver='lbfgs'
+        random_state=RANDOM_STATE,
+        solver="lbfgs",
     )
     lr.fit(X_train, y_train)
     y_pred_lr = lr.predict(X_test)
     y_prob_lr = lr.predict_proba(X_test)[:, 1]
-    
-    results['logistic_regression'] = {
-        'model': lr,
-        'predictions': y_pred_lr,
-        'probabilities': y_prob_lr,
-        'auprc': average_precision_score(y_test, y_prob_lr),
-        'f1': f1_score(y_test, y_pred_lr)
+
+    lr_result = ModelResult(
+        name="logistic_regression",
+        model=lr,
+        predictions=y_pred_lr,
+        probabilities=y_prob_lr,
+        auprc=average_precision_score(y_test, y_prob_lr),
+        f1=f1_score(y_test, y_pred_lr),
+    )
+    results.append(lr_result)
+    logger.info("   AUPRC: %.4f  |  F1: %.4f", lr_result.auprc, lr_result.f1)
+
+    # ------------------------------------------------------------------
+    # Model 2: XGBoost (Champion) — GridSearchCV
+    # ------------------------------------------------------------------
+    logger.info("[4.2] Model 2 — XGBoost (Champion)")
+
+    scale_pos_weight = float((y_train == 0).sum()) / max(float((y_train == 1).sum()), 1)
+    logger.info("   scale_pos_weight: %.2f", scale_pos_weight)
+
+    param_grid = {
+        "max_depth": [4, 6],
+        "learning_rate": [0.1, 0.3],
+        "n_estimators": [100, 200],
+        "scale_pos_weight": [scale_pos_weight],
     }
-    print(f"   AUPRC: {results['logistic_regression']['auprc']:.4f}")
-    print(f"   F1-Score: {results['logistic_regression']['f1']:.4f}")
-    
-    # -------------------------------------------------------------------------
-    # Model 2: XGBoost (Champion)
-    # -------------------------------------------------------------------------
-    print("\n[3.2] Training Model 2: XGBoost (Champion)")
-    
-    # Calculate scale_pos_weight for imbalance
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    print(f"   Scale pos weight: {scale_pos_weight:.2f}")
-    
-    # Hyperparameter tuning with GridSearchCV
-    xgb_params = {
-        'max_depth': [4, 6],
-        'learning_rate': [0.1, 0.3],
-        'n_estimators': [100],
-        'scale_pos_weight': [scale_pos_weight],
-        'eval_metric': ['aucpr'],
-        'use_label_encoder': [False]
-    }
-    
-    xgb_model = xgb.XGBClassifier(random_state=42, verbosity=0)
-    
-    print("   Running GridSearchCV...")
+
+    xgb_base = xgb.XGBClassifier(
+        random_state=RANDOM_STATE,
+        verbosity=0,
+        eval_metric="aucpr",
+        use_label_encoder=False,
+    )
+
+    logger.info("   Running GridSearchCV (scoring=average_precision)...")
     grid_search = GridSearchCV(
-        xgb_model, xgb_params, 
-        cv=3, scoring='f1', 
-        n_jobs=-1, verbose=0
+        xgb_base,
+        param_grid,
+        cv=3,
+        scoring="average_precision",
+        n_jobs=-1,
+        verbose=0,
     )
     grid_search.fit(X_train, y_train)
-    
+
     best_xgb = grid_search.best_estimator_
     y_pred_xgb = best_xgb.predict(X_test)
     y_prob_xgb = best_xgb.predict_proba(X_test)[:, 1]
-    
-    results['xgboost'] = {
-        'model': best_xgb,
-        'predictions': y_pred_xgb,
-        'probabilities': y_prob_xgb,
-        'auprc': average_precision_score(y_test, y_prob_xgb),
-        'f1': f1_score(y_test, y_pred_xgb),
-        'best_params': grid_search.best_params_
-    }
-    print(f"   Best Params: {grid_search.best_params_}")
-    print(f"   AUPRC: {results['xgboost']['auprc']:.4f}")
-    print(f"   F1-Score: {results['xgboost']['f1']:.4f}")
-    
-    # -------------------------------------------------------------------------
-    # Model 3: Isolation Forest (Anomaly Detector)
-    # -------------------------------------------------------------------------
-    print("\n[3.3] Training Model 3: Isolation Forest (Anomaly Detector)")
-    
-    # Train only on legitimate transactions (unsupervised)
+
+    xgb_result = ModelResult(
+        name="xgboost",
+        model=best_xgb,
+        predictions=y_pred_xgb,
+        probabilities=y_prob_xgb,
+        auprc=average_precision_score(y_test, y_prob_xgb),
+        f1=f1_score(y_test, y_pred_xgb),
+        best_params=grid_search.best_params_,
+    )
+    results.append(xgb_result)
+    logger.info("   Best params: %s", grid_search.best_params_)
+    logger.info("   AUPRC: %.4f  |  F1: %.4f", xgb_result.auprc, xgb_result.f1)
+
+    # ------------------------------------------------------------------
+    # Model 3: Isolation Forest (Unsupervised Anomaly Detector)
+    # ------------------------------------------------------------------
+    logger.info("[4.3] Model 3 — Isolation Forest (Anomaly Detector)")
+
+    # Train only on legitimate transactions (unsupervised paradigm)
     X_legit = X_train[y_train == 0]
-    
+    logger.info("   Training on %s legitimate samples", f"{len(X_legit):,}")
+
     iso_forest = IsolationForest(
         n_estimators=100,
-        contamination=0.01,  # Expected fraud rate
-        random_state=42,
-        n_jobs=-1
+        contamination=0.01,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
     )
     iso_forest.fit(X_legit)
-    
-    # Predict: -1 = anomaly (fraud), 1 = normal
-    y_pred_iso = iso_forest.predict(X_test)
-    y_pred_iso = np.where(y_pred_iso == -1, 1, 0)  # Convert to 0/1
-    
-    results['isolation_forest'] = {
-        'model': iso_forest,
-        'predictions': y_pred_iso,
-        'f1': f1_score(y_test, y_pred_iso)
-    }
-    print(f"   F1-Score: {results['isolation_forest']['f1']:.4f}")
-    
+
+    # Isolation Forest returns -1 for anomalies, 1 for inliers
+    y_pred_iso_raw = iso_forest.predict(X_test)
+    y_pred_iso = np.where(y_pred_iso_raw == -1, 1, 0)
+
+    iso_result = ModelResult(
+        name="isolation_forest",
+        model=iso_forest,
+        predictions=y_pred_iso,
+        probabilities=None,
+        auprc=None,
+        f1=f1_score(y_test, y_pred_iso),
+    )
+    results.append(iso_result)
+    logger.info("   F1: %.4f", iso_result.f1)
+
     return results
 
-# ==============================================================================
-# PHASE 4: EVALUATION
-# ==============================================================================
 
-def evaluate_models(results: dict, y_test: np.ndarray):
+# ---------------------------------------------------------------------------
+# Phase 5: Evaluation
+# ---------------------------------------------------------------------------
+def evaluate_models(results: List[ModelResult], y_test: np.ndarray) -> None:
     """
-    Comprehensive model evaluation with metrics and confusion matrices.
-    """
-    print(f"\n{'='*60}")
-    print("PHASE 4: EVALUATION")
-    print(f"{'='*60}")
-    
-    print("\n[4.1] Model Comparison Summary:")
-    print("-" * 50)
-    print(f"{'Model':<25} {'AUPRC':<10} {'F1-Score':<10}")
-    print("-" * 50)
-    
-    for name, res in results.items():
-        auprc = res.get('auprc', 'N/A')
-        f1 = res['f1']
-        if isinstance(auprc, float):
-            print(f"{name:<25} {auprc:<10.4f} {f1:<10.4f}")
-        else:
-            print(f"{name:<25} {auprc:<10} {f1:<10.4f}")
-    
-    # Champion model confusion matrix
-    print("\n[4.2] Champion Model (XGBoost) Confusion Matrix:")
-    cm = confusion_matrix(y_test, results['xgboost']['predictions'])
-    print(f"   True Negatives:  {cm[0,0]:,}")
-    print(f"   False Positives: {cm[0,1]:,} (Customer Insults)")
-    print(f"   False Negatives: {cm[1,0]:,} (Missed Fraud - CRITICAL)")
-    print(f"   True Positives:  {cm[1,1]:,}")
-    
-    # Classification Report
-    print("\n[4.3] Classification Report (XGBoost):")
-    print(classification_report(y_test, results['xgboost']['predictions'], 
-                                target_names=['Legitimate', 'Fraud']))
+    Print AUPRC comparison table and XGBoost confusion matrix.
 
-# ==============================================================================
-# PHASE 5: SERIALIZATION
-# ==============================================================================
+    Primary metric: **AUPRC** (Area Under Precision-Recall Curve).
+    Rationale: Standard accuracy is misleading under severe imbalance
+    (~99.87% legit). AUPRC focuses on minority-class performance.
 
-def save_models(results: dict, le_type: LabelEncoder, model_dir: str):
+    Args:
+        results: List of :class:`ModelResult` from training.
+        y_test:  Ground-truth labels for the test split.
     """
-    Serialize trained models for backend integration.
+    logger.info("=" * 60)
+    logger.info("PHASE 5: EVALUATION")
+    logger.info("=" * 60)
+
+    logger.info("")
+    logger.info("%-25s %-10s %-10s", "Model", "AUPRC", "F1-Score")
+    logger.info("-" * 50)
+
+    for res in results:
+        auprc_str = f"{res.auprc:.4f}" if res.auprc is not None else "N/A"
+        logger.info("%-25s %-10s %-10.4f", res.name, auprc_str, res.f1)
+
+    # Champion model (XGBoost) confusion matrix
+    xgb_result = next(r for r in results if r.name == "xgboost")
+    cm = confusion_matrix(y_test, xgb_result.predictions)
+    logger.info("")
+    logger.info("Champion (XGBoost) Confusion Matrix:")
+    logger.info("   True Negatives:  %s", f"{cm[0, 0]:,}")
+    logger.info("   False Positives: %s  (unnecessary blocks)", f"{cm[0, 1]:,}")
+    logger.info("   False Negatives: %s  (missed fraud — CRITICAL)", f"{cm[1, 0]:,}")
+    logger.info("   True Positives:  %s", f"{cm[1, 1]:,}")
+    logger.info("")
+    logger.info("Classification Report (XGBoost):")
+    report = classification_report(
+        y_test,
+        xgb_result.predictions,
+        target_names=["Legitimate", "Fraud"],
+    )
+    for line in report.splitlines():
+        logger.info("   %s", line)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Serialization
+# ---------------------------------------------------------------------------
+def save_models(
+    results: List[ModelResult],
+    le_type: LabelEncoder,
+    model_dir: Path,
+) -> None:
     """
-    print(f"\n{'='*60}")
-    print("PHASE 5: SERIALIZATION")
-    print(f"{'='*60}")
-    
-    os.makedirs(model_dir, exist_ok=True)
-    
-    # Save XGBoost (Champion) as primary model
-    primary_path = os.path.join(model_dir, "model_primary.pkl")
-    joblib.dump(results['xgboost']['model'], primary_path)
-    print(f"\n[5.1] Saved XGBoost model: {primary_path}")
-    
-    # Save Label Encoder
-    encoder_path = os.path.join(model_dir, "label_encoder_type.pkl")
+    Serialize models to disk for FastAPI backend consumption.
+
+    Artifacts:
+        - ``model_primary.pkl``        — XGBoost champion
+        - ``model_logistic.pkl``       — Logistic Regression baseline
+        - ``model_isolation_forest.pkl``— Isolation Forest
+        - ``label_encoder_type.pkl``   — Transaction type encoder
+
+    Args:
+        results:   List of :class:`ModelResult` from training.
+        le_type:   Fitted :class:`LabelEncoder` for the ``type`` column.
+        model_dir: Output directory path.
+    """
+    logger.info("=" * 60)
+    logger.info("PHASE 6: SERIALIZATION")
+    logger.info("=" * 60)
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact_map = {
+        "xgboost": "model_primary.pkl",
+        "logistic_regression": "model_logistic.pkl",
+        "isolation_forest": "model_isolation_forest.pkl",
+    }
+
+    for res in results:
+        filename = artifact_map.get(res.name)
+        if filename:
+            path = model_dir / filename
+            joblib.dump(res.model, path)
+            logger.info("   Saved %s → %s", res.name, path)
+
+    encoder_path = model_dir / "label_encoder_type.pkl"
     joblib.dump(le_type, encoder_path)
-    print(f"[5.2] Saved Label Encoder: {encoder_path}")
-    
-    # Save Logistic Regression (for explainability)
-    lr_path = os.path.join(model_dir, "model_logistic.pkl")
-    joblib.dump(results['logistic_regression']['model'], lr_path)
-    print(f"[5.3] Saved Logistic Regression: {lr_path}")
-    
-    # Save Isolation Forest (for anomaly detection)
-    iso_path = os.path.join(model_dir, "model_isolation_forest.pkl")
-    joblib.dump(results['isolation_forest']['model'], iso_path)
-    print(f"[5.4] Saved Isolation Forest: {iso_path}")
-    
-    print(f"\n✅ All models saved to: {model_dir}/")
+    logger.info("   Saved LabelEncoder → %s", encoder_path)
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
+    logger.info("")
+    logger.info("✅ All artifacts saved to %s/", model_dir)
 
-def main():
+
+# ---------------------------------------------------------------------------
+# CLI & Main
+# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="AnomalyWatchers — Tri-Model Fraud Detection Pipeline"
+    )
+    parser.add_argument(
+        "--sample-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of legitimate data to sample (default: 0.1 for dev)",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Use full dataset (overrides --sample-frac to 1.0)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
     """
-    Execute the complete ML Pipeline.
+    Execute the complete ML pipeline end-to-end.
+
+    Steps:
+        1. Parse CLI args
+        2. Load and sample data  (Phase 1)
+        3. Engineer features     (Phase 2)
+        4. Apply SMOTE           (Phase 3)
+        5. Train tri-models      (Phase 4)
+        6. Evaluate              (Phase 5)
+        7. Serialize             (Phase 6)
     """
-    print("\n" + "="*60)
-    print("ANOMALYWATCHERS - ML PIPELINE TRAINING")
-    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*60)
-    
-    # Phase 1: Load Data
-    df = load_primary_dataset(PRIMARY_DATASET, sample_frac=1.0)
-    
-    # Phase 2: Feature Engineering
+    args = parse_args()
+    sample_frac = 1.0 if args.full else args.sample_frac
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("ANOMALYWATCHERS — UNIFIED ML PIPELINE")
+    logger.info("Timestamp: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(
+        "Mode: %s",
+        "FULL" if sample_frac >= 1.0 else f"SAMPLE ({sample_frac * 100:.0f}%)",
+    )
+    logger.info("=" * 60)
+
+    # Phase 1 — Data
+    df = load_primary_dataset(PRIMARY_DATASET, sample_frac=sample_frac)
+
+    # Phase 2 — Features
     features_df, le_type = engineer_features(df)
-    
-    # Prepare train/test split
+
     X = features_df[FEATURE_COLUMNS].values
     y = features_df[TARGET_COLUMN].values
-    
-    print(f"\n[2.5] Splitting data (80/20)...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+
+    logger.info(
+        "[2.5] Train/test split (%.0f/%.0f)...", (1 - TEST_SIZE) * 100, TEST_SIZE * 100
     )
-    print(f"   Train size: {len(X_train):,}")
-    print(f"   Test size: {len(X_test):,}")
-    
-    # Apply SMOTE for class balancing (only on training data)
-    if SMOTE_AVAILABLE:
-        print(f"\n[2.6] Applying SMOTE for class balancing...")
-        smote = SMOTE(random_state=42)
-        X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
-        print(f"   Balanced train size: {len(X_train_balanced):,}")
-        print(f"   Fraud ratio after SMOTE: {y_train_balanced.mean()*100:.2f}%")
-    else:
-        print(f"\n[2.6] Using class weights (SMOTE not available)...")
-        X_train_balanced, y_train_balanced = X_train, y_train
-        print(f"   Train size: {len(X_train_balanced):,}")
-        print(f"   Using class_weight='balanced' in models")
-    
-    # Phase 3: Train Models
-    results = train_models(X_train_balanced, X_test, y_train_balanced, y_test)
-    
-    # Phase 4: Evaluate
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+    )
+    logger.info("   Train: %s  |  Test: %s", f"{len(X_train):,}", f"{len(X_test):,}")
+
+    # Phase 3 — SMOTE
+    X_train_balanced, y_train_balanced = apply_smote(X_train, y_train)
+
+    # Phase 4 — Train
+    results = train_tri_models(X_train_balanced, X_test, y_train_balanced, y_test)
+
+    # Phase 5 — Evaluate
     evaluate_models(results, y_test)
-    
-    # Phase 5: Save Models
+
+    # Phase 6 — Save
     save_models(results, le_type, MODEL_DIR)
-    
-    print("\n" + "="*60)
-    print("✅ ML PIPELINE COMPLETE")
-    print("="*60)
-    print("\nNext Steps:")
-    print("1. Restart the backend server to load the new models")
-    print("2. Test with the frontend (High Risk preset)")
-    print("3. Verify predictions match expected behavior")
-    
-    return results
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("✅ ML PIPELINE COMPLETE")
+    logger.info("=" * 60)
+    logger.info("Next steps:")
+    logger.info("  1. Restart backend:  uvicorn backend.app.main:app --reload")
+    logger.info("  2. Start frontend:   npm run dev")
+    logger.info("  3. Test with the High Risk preset in the Simulator")
+
 
 if __name__ == "__main__":
     main()

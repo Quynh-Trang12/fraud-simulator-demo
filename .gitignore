@@ -13,7 +13,7 @@ dist
 dist-ssr
 *.local
 
-# Python / Data (Added to fix push error)
+# Python / Data
 __pycache__/
 *.py[cod]
 *$py.class
@@ -23,6 +23,7 @@ env/
 data/
 *.csv
 *.pkl
+.ipynb_checkpoints/
 
 # Editor directories and files
 .vscode/*
@@ -34,3 +35,7 @@ data/
 *.njsproj
 *.sln
 *.sw?
+
+# Debug artifacts
+debug_output.txt
+debug_model.py

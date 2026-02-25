@@ -248,11 +248,19 @@ export function TransactionForm() {
       if (riskScore > 80) decision = "BLOCK";
       else if (riskScore > 40) decision = "STEP_UP";
 
-      // Create Reasons List
+      // Create Reasons List — use structured XAI factors from the backend
       const modelReasons = [
         `AI Risk Probability: ${riskScore}%`,
         `Risk Level: ${riskLevel}`,
       ];
+
+      // Append structured risk factors from the backend XAI engine
+      if (apiResponse.risk_factors && apiResponse.risk_factors.length > 0) {
+        for (const rf of apiResponse.risk_factors) {
+          modelReasons.push(rf.factor);
+        }
+      }
+
       if (isFlaggedFraud)
         modelReasons.push("Matches Legacy Fraud Patterns (Rule-based)");
 
