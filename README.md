@@ -25,15 +25,13 @@ A full-stack, AI-powered fraud detection platform that combines a **tri-model ML
 
 ## Datasets
 
-| Dataset                                         | Source                                                                                     | Role                      | Schema                                                                                     |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------- | ------------------------------------------------------------------------------------------ |
-| **Rupak Roy** — Online Payments Fraud Detection | [Kaggle](https://www.kaggle.com/datasets/rupakroy/online-payments-fraud-detection-dataset) | **Primary (Trainer)**     | `type`, `amount`, `oldbalanceOrg`, `newbalanceOrig`, `errorBalanceOrg`, `errorBalanceDest` |
-| **Kartik2112** — Fraud Detection                | [Kaggle](https://www.kaggle.com/datasets/kartik2112/fraud-detection)                       | **Secondary (Validator)** | `amt`, `lat`, `long`, `merch_lat`, `merch_long`, `dob`, `city_pop`                         |
+| Dataset                                         | Source                                                                                     | Role                  | Schema                                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- | ------------------------------------------------------------------------------------------ |
+| **Rupak Roy** — Online Payments Fraud Detection | [Kaggle](https://www.kaggle.com/datasets/rupakroy/online-payments-fraud-detection-dataset) | **Primary (Trainer)** | `type`, `amount`, `oldbalanceOrg`, `newbalanceOrig`, `errorBalanceOrg`, `errorBalanceDest` |
 
-### Why Two Datasets?
+### About Dataset
 
 - **Rupak Roy (Paysim)** simulates mobile money transactions with extreme class imbalance (~0.13% fraud). It defines our core schema and is the primary training source.
-- **Kartik2112 (Sparkov)** covers credit card transactions with geospatial features. It validates that the system generalizes across domains and is not overfitting to a single distribution.
 
 ---
 
@@ -140,27 +138,39 @@ The app starts at `http://localhost:8080` (proxies `/predict/*` to the backend).
 ## Project Structure
 
 ```
-anomaly-watchers-donutpuff/
-├── backend/
-│   └── app/
-│       ├── main.py              # FastAPI application
-│       └── schemas.py           # Pydantic request/response models
-├── scripts/
-│   ├── train_models.py          # Unified tri-model pipeline
-│   └── download_data.py         # Dataset downloader
-├── notebooks/
-│   ├── 01_primary_analysis.ipynb
-│   └── 02_secondary_analysis.ipynb
-├── src/                         # React frontend (Vite + TypeScript)
-│   ├── components/
-│   │   ├── Dashboard.tsx        # Live risk monitor
-│   │   └── simulator/           # Transaction form + presets
-│   ├── pages/                   # Route pages
-│   ├── api.ts                   # Backend API client
-│   └── lib/                     # Utilities, scoring, storage
-├── requirements.txt             # Python dependencies
-├── package.json                 # Node.js dependencies
-└── README.md                    # This file
+AnomalyWatchers-DonutPuff/
+├── backend/                          # FastAPI Python Domain
+│   ├── app/                          # Core API Application
+│   │   ├── main.py                   # API endpoints, lifecycle, & heuristic engine
+│   │   └── schemas.py                # Strict Pydantic input/output validation
+│   ├── models/                       # SSOT ML Handoff Directory (*.pkl, *.joblib)
+│   │   └── .gitkeep                  # Preserves folder structure (binaries git-ignored)
+│   ├── tests/                        # Integration Testing
+│   │   ├── test_endpoints.py         # Endpoint health and latency tests
+│   │   └── test_prob.py              # Probability boundary tests
+│   └── requirements.txt              # Isolated Python dependencies
+│
+├── frontend/                         # React (Vite + TypeScript) UI Domain
+│   ├── public/                       # Static assets (icons, SVGs)
+│   ├── src/                          # Core Frontend Logic
+│   │   ├── components/               # Modular UI (Dashboard, Simulator, Charts)
+│   │   ├── pages/                    # Application Routes (Admin, Simulate, History)
+│   │   ├── lib/                      # Utilities, local storage, XAI scoring rules
+│   │   └── api.ts                    # Strongly-typed Backend API client
+│   ├── package.json                  # Isolated Node.js dependencies
+│   ├── tailwind.config.ts            # UI styling configuration
+│   └── vite.config.ts                # Frontend bundler configuration
+│
+├── ml_pipeline/                      # Machine Learning & Data Domain
+│   ├── data/                         # Raw datasets (Git-ignored)
+│   ├── notebooks/                    # Exploratory Data Analysis (EDA)
+│   │   └── 01_primary_analysis.ipynb # Paysim feature engineering & SMOTE
+│   └── scripts/                      # ML Execution Pipeline
+│       └── train_models.py           # Unified model training & serialization
+│
+├── .gitignore                        # Repository-wide ignore rules (blocks data & models)
+├── start_project.bat                 # Unified multi-terminal orchestrator
+└── README.md                         # Project documentation (You are here)
 ```
 
 ---
