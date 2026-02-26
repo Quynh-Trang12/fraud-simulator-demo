@@ -1,6 +1,0 @@
-normal_payment: code=200, prob=5.573696853389265e-06, risk=Low
-large_transfer: code=200, prob=0.6, risk=Medium
-suspicious_cashout: code=200, prob=0.9974853992462158, risk=High
-large_cashin: code=200, prob=0.7, risk=Medium
-small_debit: code=200, prob=1.023957065626746e-05, risk=Low
-known_fraud_pattern: code=200, prob=0.95, risk=High

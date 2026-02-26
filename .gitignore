@@ -20,9 +20,7 @@ __pycache__/
 .venv/
 venv/
 env/
-data/
 *.csv
-*.pkl
 .ipynb_checkpoints/
 
 # Editor directories and files
@@ -39,3 +37,9 @@ data/
 # Debug artifacts
 debug_output.txt
 debug_model.py
+
+# Machine Learning Artifacts
+*.pkl
+*.joblib
+backend/models/*
+!backend/models/.gitkeep
